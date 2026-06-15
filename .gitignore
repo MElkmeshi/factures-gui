@@ -1,0 +1,16 @@
+# Sensitive invoice / driver data — never push this
+*.xlsx
+Factures_*/
+Factures_*.zip
+
+# Python / build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# OS / editor
+.DS_Store
+.vscode/
+.omc/

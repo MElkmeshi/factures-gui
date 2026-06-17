@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 openpyxl
+Pillow  # required by openpyxl to embed the logo image in the invoices

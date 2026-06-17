@@ -26,7 +26,6 @@ jobs:
         run: >
           pyinstaller --onefile --windowed
           --name FacturesGUI
-          --add-data "generate_factures.py;."
           factures_gui.py
 
       - name: Upload EXE artifact

@@ -23,7 +23,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 HERE = Path(__file__).resolve().parent
-SCRIPT = HERE / "generate_factures.py"
 DEFAULT_WORKBOOK = HERE / "Factures Livreurs.xlsx"
 
 
@@ -133,48 +132,46 @@ class FacturesGUI:
         if not self.pdf_var.get() and not self.excel_var.get():
             messagebox.showerror("Erreur", "Choisissez au moins un type de sortie (PDF ou Excel).")
             return
-        if not SCRIPT.exists():
-            messagebox.showerror("Erreur", f"Script introuvable : {SCRIPT}")
-            return
 
-        cmd = [sys.executable, str(SCRIPT), workbook, "--year", str(self.year_var.get())]
-        outdir = self.outdir_var.get().strip()
-        if outdir:
-            cmd += ["--out", outdir]
-            self.last_out_dir = outdir
-        else:
-            self.last_out_dir = None  # resolved from the printed log below
-        if self.keep_var.get():
-            cmd.append("--keep-xlsx")
-        if not self.pdf_var.get():
-            cmd.append("--no-pdf")
-        if not self.excel_var.get():
-            cmd.append("--no-excel")
+        params = {
+            "workbook": workbook,
+            "year": int(self.year_var.get()),
+            "out": self.outdir_var.get().strip() or None,
+            "keep_xlsx": self.keep_var.get(),
+            "no_pdf": not self.pdf_var.get(),
+            "no_excel": not self.excel_var.get(),
+        }
+        self.last_out_dir = None
 
         self._clear_log()
-        self._append_log("$ " + " ".join(cmd) + "\n\n")
+        self._append_log(
+            f"Classeur : {workbook}\nAnnée : {params['year']}\n"
+            f"PDF : {'oui' if not params['no_pdf'] else 'non'}   "
+            f"Excel : {'oui' if not params['no_excel'] else 'non'}\n\n"
+        )
         self.run_btn["state"] = "disabled"
         self.open_btn["state"] = "disabled"
 
-        threading.Thread(target=self._worker, args=(cmd,), daemon=True).start()
+        threading.Thread(target=self._worker, args=(params,), daemon=True).start()
 
-    def _worker(self, cmd):
+    def _worker(self, params):
+        # Import here (not at module top) so a missing dependency surfaces in the
+        # log instead of crashing the whole app at startup.
         try:
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                cwd=str(HERE),
-            )
-            for line in self.proc.stdout:
-                self.log_queue.put(("line", line))
-                # The script prints "... in: <dir>" — capture it for "Open folder".
-                if self.last_out_dir is None and " in: " in line:
-                    self.last_out_dir = line.split(" in: ", 1)[1].strip()
-            code = self.proc.wait()
-            self.log_queue.put(("done", code))
+            import generate_factures
+        except Exception as exc:  # noqa: BLE001
+            self.log_queue.put(("line", f"\nERREUR: impossible de charger le moteur : {exc}\n"))
+            self.log_queue.put(("done", -1))
+            return
+
+        def log(msg):
+            self.log_queue.put(("line", str(msg) + "\n"))
+
+        try:
+            out_dir = generate_factures.generate(log=log, **params)
+            if out_dir:
+                self.last_out_dir = str(out_dir)
+            self.log_queue.put(("done", 0))
         except Exception as exc:  # noqa: BLE001
             self.log_queue.put(("line", f"\nERREUR: {exc}\n"))
             self.log_queue.put(("done", -1))

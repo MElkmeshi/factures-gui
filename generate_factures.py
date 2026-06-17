@@ -73,7 +73,7 @@ def find_soffice():
         path = shutil.which(cand) if "/" not in cand and "\\" not in cand else (cand if Path(cand).exists() else None)
         if path:
             return path
-    sys.exit("ERROR: LibreOffice (soffice) not found. Install it to render PDFs.")
+    raise RuntimeError("LibreOffice (soffice) not found. Install it to render PDFs.")
 
 
 def locate_table(ws):
@@ -85,7 +85,7 @@ def locate_table(ws):
                 headers = {c2: (str(ws.cell(r, c2).value).strip() if ws.cell(r, c2).value else "")
                            for c2 in range(1, ws.max_column + 1)}
                 return header_row, headers
-    sys.exit("ERROR: could not find 'Driver Name' header on the sheet.")
+    raise ValueError("could not find 'Driver Name' header on the sheet.")
 
 
 def col_by(headers, *names):
@@ -99,7 +99,7 @@ def parse_invoice_meta(headers, year):
     """Derive invoice number and date from the service/total headers."""
     service_cols = [c for c, h in headers.items() if h.lower().startswith("services")]
     if not service_cols:
-        sys.exit("ERROR: no 'Services ...' columns found.")
+        raise ValueError("no 'Services ...' columns found.")
 
     total_hdr = next((h for h in headers.values() if h.upper().startswith("TOTAL")), "")
     month = None
@@ -195,25 +195,22 @@ def unique_sheet_name(name, drv_id, used):
     return title
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("workbook", nargs="?", default="Factures Livreurs.xlsx")
-    ap.add_argument("--year", type=int, default=2025)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--keep-xlsx", action="store_true")
-    ap.add_argument("--no-pdf", action="store_true", help="skip the per-driver PDFs")
-    ap.add_argument("--no-excel", action="store_true",
-                    help="skip the combined workbook with one sheet per driver")
-    args = ap.parse_args()
+def generate(workbook="Factures Livreurs.xlsx", year=2025, out=None,
+             keep_xlsx=False, no_pdf=False, no_excel=False, log=print):
+    """Generate the invoices. Returns the output directory (Path).
 
-    src = Path(args.workbook)
+    `log` is a callback used for progress messages (defaults to print, so the
+    CLI behaves as before; the GUI passes its own logger). Errors are raised as
+    exceptions so callers can present them however they like.
+    """
+    src = Path(workbook)
     if not src.exists():
-        sys.exit(f"ERROR: file not found: {src}")
-    soffice = find_soffice()
+        raise FileNotFoundError(f"file not found: {src}")
+    soffice = find_soffice() if not no_pdf else None
 
     wb = openpyxl.load_workbook(src)
     if "Sheet1" not in wb.sheetnames or HEADER_SHEET not in wb.sheetnames:
-        sys.exit("ERROR: workbook must contain 'Sheet1' and 'Exemple' sheets.")
+        raise ValueError("workbook must contain 'Sheet1' and 'Exemple' sheets.")
     data = wb["Sheet1"]
     tmpl = wb[HEADER_SHEET]
 
@@ -226,17 +223,17 @@ def main():
     c_id = col_by(headers, "Driver ID")
     c_mf = col_by(headers, "MF")
     c_addr = col_by(headers, "Adresse", "Address")
-    service_cols, inv_num, inv_date, total_hdr = parse_invoice_meta(headers, args.year)
+    service_cols, inv_num, inv_date, total_hdr = parse_invoice_meta(headers, year)
 
-    print(f"Month column: {total_hdr!r} -> facture #{inv_num}, date {inv_date.date()}")
-    print(f"Service columns: {[headers[c] for c in service_cols]}")
+    log(f"Month column: {total_hdr!r} -> facture #{inv_num}, date {inv_date.date()}")
+    log(f"Service columns: {[headers[c] for c in service_cols]}")
 
     # show only the invoice sheet in the rendered PDF
     for ws in wb.worksheets:
         ws.sheet_state = "visible" if ws.title == HEADER_SHEET else "hidden"
     wb.active = wb.sheetnames.index(HEADER_SHEET)
 
-    out_dir = Path(args.out) if args.out else src.parent / f"Factures_{safe(total_hdr) or 'OUTPUT'}_{args.year}"
+    out_dir = Path(out) if out else src.parent / f"Factures_{safe(total_hdr) or 'OUTPUT'}_{year}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # collect every qualifying driver once
@@ -260,9 +257,10 @@ def main():
             "services": [s for s in services if s[1] > 0],  # only non-zero lines
         })
 
-    print(f"Qualifying drivers: {len(drivers)} (skipped {skipped} all-zero drivers).")
+    log(f"Qualifying drivers: {len(drivers)} (skipped {skipped} all-zero drivers).")
     if not drivers:
-        return
+        log("Nothing to generate.")
+        return out_dir
 
     def refresh_logo(ws):
         ws._images = []
@@ -272,7 +270,7 @@ def main():
             ws.add_image(img)
 
     # --- one PDF per driver --------------------------------------------------
-    if not args.no_pdf:
+    if not no_pdf:
         tmp_dir = out_dir / "_tmp_xlsx"
         tmp_dir.mkdir(exist_ok=True)
         xlsx_files = []
@@ -283,18 +281,19 @@ def main():
             wb.save(path)
             xlsx_files.append(path)
 
+        log(f"Rendering {len(xlsx_files)} PDFs with LibreOffice…")
         for i in range(0, len(xlsx_files), 25):
             subprocess.run(
                 [soffice, "--headless", "--calc", "--convert-to", "pdf",
                  "--outdir", str(out_dir), *map(str, xlsx_files[i:i + 25])],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        print(f"Created {len(list(out_dir.glob('*.pdf')))} PDFs in: {out_dir}")
-        if not args.keep_xlsx:
+        log(f"Created {len(list(out_dir.glob('*.pdf')))} PDFs in: {out_dir}")
+        if not keep_xlsx:
             shutil.rmtree(tmp_dir)
 
     # --- one workbook, one sheet per driver ----------------------------------
-    if not args.no_excel:
+    if not no_excel:
         book = openpyxl.load_workbook(src)
         template = book[HEADER_SHEET]
         used = set()
@@ -308,9 +307,28 @@ def main():
                      {unique for unique in used}]:
             del book[name]
         book.active = 0
-        xlsx_out = out_dir / f"Factures_{safe(total_hdr) or 'OUTPUT'}_{args.year}_par_livreur.xlsx"
+        xlsx_out = out_dir / f"Factures_{safe(total_hdr) or 'OUTPUT'}_{year}_par_livreur.xlsx"
         book.save(xlsx_out)
-        print(f"Created workbook with {len(drivers)} driver sheets: {xlsx_out}")
+        log(f"Created workbook with {len(drivers)} driver sheets: {xlsx_out}")
+
+    return out_dir
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workbook", nargs="?", default="Factures Livreurs.xlsx")
+    ap.add_argument("--year", type=int, default=2025)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--keep-xlsx", action="store_true")
+    ap.add_argument("--no-pdf", action="store_true", help="skip the per-driver PDFs")
+    ap.add_argument("--no-excel", action="store_true",
+                    help="skip the combined workbook with one sheet per driver")
+    args = ap.parse_args()
+    try:
+        generate(args.workbook, year=args.year, out=args.out,
+                 keep_xlsx=args.keep_xlsx, no_pdf=args.no_pdf, no_excel=args.no_excel)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        sys.exit(f"ERROR: {exc}")
 
 
 if __name__ == "__main__":

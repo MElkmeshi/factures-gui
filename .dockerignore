@@ -1,0 +1,13 @@
+.git
+.github
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+backend/_jobs
+*.xlsx
+Factures_*/
+Factures_*.zip
+.DS_Store
+.vscode
+.omc

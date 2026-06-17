@@ -10,6 +10,14 @@ build/
 dist/
 *.spec
 
+# Web app
+frontend/node_modules/
+frontend/dist/
+backend/_jobs/
+
+# Python venv
+.venv/
+
 # OS / editor
 .DS_Store
 .vscode/

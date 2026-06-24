@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Generate one PDF invoice (facture) per delivery driver from a "Factures Livreurs"
-workbook, using the workbook's own `Exemple` sheet as the visual template.
+workbook. The visual template (the `Exemple` sheet) is hardcoded into the app
+(see factures_template.py), so an uploaded workbook only needs a `Sheet1`. A
+workbook that still ships its own `Exemple` sheet keeps using it.
 
 Rules:
   * Only Sheet1 is read for driver data.
@@ -9,10 +11,12 @@ Rules:
     "Services ..." column. Drivers with all-zero services are skipped.
   * "Numéro de facture" = month index. Counting started in August 2025, so for
     2025: Aug=1, Sep=2, Oct=3, Nov=4, Dec=5. From 2026 on it is the plain
-    calendar month (Jan=1, Feb=2, ...). The month is taken from the
-    "TOTAL <MONTH>" column header.
-  * "Date de facture" = latest service date found in the "Services ..." headers
-    (e.g. "...-25/08"), combined with the year.
+    calendar month (Jan=1, Feb=2, ...). The month is read from the most explicit
+    signal available: a "TOTAL <MONTH>" column header, else dd/mm dates in the
+    amount headers, else ISO week numbers (headers like "W48").
+  * "Date de facture" = latest service date found in the amount headers
+    (e.g. "...-25/08") combined with the year; for monthly files that carry no
+    per-line date it is the last day of the billing month.
 
 Usage:
   python3 generate_factures.py [workbook.xlsx] [--year 2025] [--out DIR] [--keep-xlsx]
@@ -20,6 +24,7 @@ Usage:
 Requires: openpyxl, and LibreOffice (`soffice`) for the PDF conversion.
 """
 import argparse
+import calendar
 import datetime
 import re
 import shutil
@@ -31,6 +36,8 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
+
+from factures_template import load_template_workbook
 
 MONTHS = {
     "JANUARY": 1, "FEBRUARY": 2, "MARCH": 3, "APRIL": 4, "MAY": 5, "JUNE": 6,
@@ -77,15 +84,46 @@ def find_soffice():
 
 
 def locate_table(ws):
-    """Find the header row and column indices on the data sheet."""
-    for r in range(1, 30):
-        for c in range(1, ws.max_column + 1):
-            if str(ws.cell(r, c).value).strip().lower() == "driver name":
-                header_row = r
-                headers = {c2: (str(ws.cell(r, c2).value).strip() if ws.cell(r, c2).value else "")
-                           for c2 in range(1, ws.max_column + 1)}
-                return header_row, headers
-    raise ValueError("could not find 'Driver Name' header on the sheet.")
+    """Find the header row and the driver-name column on the data sheet.
+
+    Prefers an exact "Driver Name" header, then falls back to plain "Driver" and
+    finally any header containing "driver" (ignoring "Driver ID"), so sheets that
+    label the column slightly differently still work.
+    """
+    predicates = (
+        lambda h: h == "driver name",
+        lambda h: h == "driver",
+        lambda h: "driver" in h and "id" not in h,
+        lambda h: "driver" in h,
+    )
+    for match in predicates:
+        for r in range(1, 30):
+            for c in range(1, ws.max_column + 1):
+                val = ws.cell(r, c).value
+                if val and match(str(val).strip().lower()):
+                    headers = {c2: (str(ws.cell(r, c2).value).strip() if ws.cell(r, c2).value else "")
+                               for c2 in range(1, ws.max_column + 1)}
+                    return r, headers, c
+    raise ValueError("could not find a 'Driver Name' (or 'Driver') header on the sheet.")
+
+
+def pick_data_sheet(wb):
+    """Return the sheet that holds the driver table.
+
+    Prefers 'Sheet1', then falls back to 'Details' (newer monthly files keep a
+    plain driver directory on Sheet1 and the billable table on 'Details'), then
+    any other sheet with a recognizable driver header.
+    """
+    ordered = [n for n in ("Sheet1", "Details") if n in wb.sheetnames]
+    ordered += [ws.title for ws in wb.worksheets if ws.title not in ordered]
+    for name in ordered:
+        try:
+            locate_table(wb[name])
+            return wb[name]
+        except ValueError:
+            continue
+    raise ValueError("no sheet with a 'Driver'/'Driver Name' header found "
+                     "(looked at 'Sheet1', 'Details').")
 
 
 def col_by(headers, *names):
@@ -95,36 +133,72 @@ def col_by(headers, *names):
     return None
 
 
+# Header names that identify a driver (not a billable amount); used to locate
+# the amount columns on layouts that don't label them "Services ...".
+IDENTITY_HEADERS = {
+    "driver", "driver name", "driver id", "type", "mf", "cin", "check cin",
+    "check", "adresse", "address", "phone", "status", "manual id", "issues",
+    "patente/auto entrepreneur", "matriculep", "remarque", "name", "id", "ref",
+}
+
+
 def parse_invoice_meta(headers, year):
     """Derive invoice number and date from the service/total headers."""
+    total_hdr = next((h for h in headers.values() if h.upper().startswith("TOTAL")), "")
+
+    # 1) Locate the per-period amount columns.
     service_cols = [c for c, h in headers.items() if h.lower().startswith("services")]
     if not service_cols:
-        raise ValueError("no 'Services ...' columns found.")
+        # Newer layouts ('Details' sheet): the amount columns sit after the
+        # identity columns. They may be bounded by a 'Total ...' column (e.g.
+        # weeks W44-W47 then 'Total September') or simply run to the end of the
+        # table when there is no total column at all (e.g. W48-W51).
+        total_col = next((c for c, h in headers.items()
+                          if h.upper().startswith("TOTAL")), None)
+        last_id = max([c for c, h in headers.items()
+                       if h and h.lower() in IDENTITY_HEADERS], default=0)
+        upper = total_col if total_col else max(headers) + 1
+        service_cols = [c for c, h in headers.items()
+                        if h and last_id < c < upper
+                        and h.lower() not in IDENTITY_HEADERS]
+    if not service_cols:
+        raise ValueError("no service/amount columns found on the data sheet.")
 
-    total_hdr = next((h for h in headers.values() if h.upper().startswith("TOTAL")), "")
+    # 2) Determine the billing month, most explicit signal first: a
+    #    'Total <MONTH>' name, then dd/mm dates, then ISO week numbers (headers
+    #    like 'W48') found in the amount columns.
+    dates = [m for m in (re.search(r"(\d{1,2})/(\d{1,2})", headers[c])
+                         for c in service_cols) if m]
+    weeks = [int(m.group(1)) for c in service_cols
+             if (m := re.fullmatch(r"[Ww](\d{1,2})", headers[c].strip()))]
     month = None
     for token in re.split(r"[\s_]+", total_hdr.upper()):
         if token in MONTHS:
             month = MONTHS[token]
             break
+    if month is None and dates:
+        month = max(int(m.group(2)) for m in dates)
+    if month is None and weeks:
+        month = datetime.date.fromisocalendar(year, max(weeks), 7).month
     if month is None:
-        # fall back to the month of the latest service date
-        month = max(int(m.group(2)) for m in
-                    (re.search(r"(\d{1,2})/(\d{1,2})", headers[c]) for c in service_cols) if m)
+        raise ValueError("could not determine the billing month from the headers "
+                         "(no 'Total <month>', dates, or week numbers found).")
 
+    # 3) Invoice number: Aug 2025 = 1 ... Dec 2025 = 5; calendar month from 2026.
     if year == 2025 and month >= 8:
         inv_num = month - 7
     else:
         inv_num = month
 
-    # latest dd/mm in the service headers -> invoice date
+    # 4) Invoice date: an explicit dd/mm in the headers wins; otherwise the last
+    #    day of the billing month (these monthly files carry no per-line dates).
     best = None
-    for c in service_cols:
-        m = re.search(r"(\d{1,2})/(\d{1,2})", headers[c])
-        if m:
-            d = datetime.datetime(year, int(m.group(2)), int(m.group(1)))
-            best = d if best is None or d > best else best
-    inv_date = best or datetime.datetime(year, month, 1)
+    for m in dates:
+        d = datetime.datetime(year, int(m.group(2)), int(m.group(1)))
+        best = d if best is None or d > best else best
+    if best is None:
+        best = datetime.datetime(year, month, calendar.monthrange(year, month)[1])
+    inv_date = best
     return service_cols, inv_num, inv_date, total_hdr
 
 
@@ -208,18 +282,28 @@ def generate(workbook="Factures Livreurs.xlsx", year=2025, out=None,
         raise FileNotFoundError(f"file not found: {src}")
     soffice = find_soffice() if not no_pdf else None
 
-    wb = openpyxl.load_workbook(src)
-    if "Sheet1" not in wb.sheetnames or HEADER_SHEET not in wb.sheetnames:
-        raise ValueError("workbook must contain 'Sheet1' and 'Exemple' sheets.")
-    data = wb["Sheet1"]
+    upload = openpyxl.load_workbook(src)
+
+    # Read driver values from a data sheet (Sheet1, else Details). Load with
+    # data_only so formula cells — the 'Details' layout computes amounts via
+    # VLOOKUP — yield their cached numbers instead of the formula text.
+    values = openpyxl.load_workbook(src, data_only=True)
+    data = pick_data_sheet(values)
+
+    # The invoice template is hardcoded (see factures_template.py), so the upload
+    # only needs a data sheet. A workbook that still ships its own 'Exemple' sheet
+    # keeps using it, for backward compatibility.
+    if HEADER_SHEET in upload.sheetnames:
+        wb = upload
+    else:
+        wb = load_template_workbook()
     tmpl = wb[HEADER_SHEET]
 
     # The template logo's image stream is consumed on the first save, so capture
     # its bytes + anchor once and rebuild a fresh image before each save.
     logos = [(img._data(), img.anchor) for img in tmpl._images]
 
-    header_row, headers = locate_table(data)
-    c_name = col_by(headers, "Driver Name")
+    header_row, headers, c_name = locate_table(data)
     c_id = col_by(headers, "Driver ID")
     c_mf = col_by(headers, "MF")
     c_addr = col_by(headers, "Adresse", "Address")
@@ -294,7 +378,8 @@ def generate(workbook="Factures Livreurs.xlsx", year=2025, out=None,
 
     # --- one workbook, one sheet per driver ----------------------------------
     if not no_excel:
-        book = openpyxl.load_workbook(src)
+        book = openpyxl.load_workbook(src) if HEADER_SHEET in upload.sheetnames \
+            else load_template_workbook()
         template = book[HEADER_SHEET]
         used = set()
         for drv in drivers:

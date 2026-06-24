@@ -18,6 +18,7 @@ COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY generate_factures.py ./generate_factures.py
+COPY factures_template.py ./factures_template.py
 COPY backend/ ./backend/
 COPY --from=frontend /app/frontend/dist ./frontend/dist
 

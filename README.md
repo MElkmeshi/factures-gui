@@ -38,6 +38,9 @@ The combined-Excel output works without it.
 ## How it works
 
 - `generate_factures.py` — the engine. `generate(...)` does the work; also usable as a CLI.
+- The invoice template (the `Exemple` sheet, including the Presto logo) is hardcoded in
+  `factures_template.py`, so an uploaded workbook only needs a `Sheet1`. Regenerate it with
+  `python tools/build_template.py "Factures Livreurs.xlsx"` (needs Pillow) if the design changes.
 - `backend/app.py` — wraps `generate()`: `POST /api/jobs` (upload) → background job →
   `GET /api/jobs/{id}/stream` (SSE live log) → `GET /api/jobs/{id}/download` (zip).
 - Each job gets an unguessable id; uploaded files + output are deleted after one hour.
